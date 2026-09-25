@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    paths:
+      - '.github/workflows/*.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Build
+        uses: dabao1955/kernel_build_action@main
+        with:
+          kernel-url: https://github.com/aafiqbinkhayer-Toshiro/samsung-m23xq-kernel-source-hackX-
+          kernel-branch: main
+          config: vendor/m23xq_swa_open_defconfig
+          arch: arm64
+          aosp-gcc: true
+          aosp-clang: true
+          android-version: 11
+          anykernel3: true
+          release: true
+          access-token: ${{ secrets.GITHUB_TOKEN }}
