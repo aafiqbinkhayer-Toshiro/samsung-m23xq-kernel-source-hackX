@@ -16,8 +16,8 @@ jobs:
       - name: Build
         uses: dabao1955/kernel_build_action@main
         with:
-          kernel-url: https://github.com/aafiqbinkhayer-Toshiro/samsung-m23xq-kernel-source-hackX
-          kernel-branch: main
+          kernel-url: https://github.com/aafiqbinkhayer-Toshiro/samsung-m23xq-kernel-source-hackX-
+          kernel-branch: master
           config: vendor/m23xq_swa_open_defconfig
           arch: arm64
           aosp-gcc: true
