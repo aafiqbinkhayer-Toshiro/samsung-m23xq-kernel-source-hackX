@@ -1,28 +1,134 @@
-name: CI
+name: Build M23XQ Kernel
 
 on:
-  push:
-    paths:
-      - '.github/workflows/*.yml'
   workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: 'Kernel source repo (owner/repo)'
+        required: true
+        default: 'aafiqbinkhayer-Toshiro/samsung-m23xq-kernel-source-hackX'
+      kernel_branch:
+        description: 'Branch'
+        required: true
+        default: 'master'
+      defconfig:
+        description: 'Defconfig target'
+        required: true
+        default: 'vendor/m23xq_swa_open_defconfig'
 
-permissions:
-  contents: write
+env:
+  CLANG_URL: https://github.com/llvm/llvm-project/releases/download/llvmorg-10.0.0/clang+llvm-10.0.0-x86_64-linux-gnu-ubuntu-18.04.tar.xz
+  GCC_TAG: android-14.0.0_r0.32
+  GCC_ARCHIVE_URL: https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/android-14.0.0_r0.32.tar.gz
 
 jobs:
-  build-kernel:
+  build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Build
-        uses: dabao1955/kernel_build_action@main
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
         with:
-          kernel-url: https://github.com/aafiqbinkhayer-Toshiro/samsung-m23xq-kernel-source-hackX
-          kernel-branch: master
-          config: vendor/m23xq_swa_open_defconfig
-          arch: arm64
-          aosp-gcc: true
-          aosp-clang: true
-          android-version: 11
-          anykernel3: true
-          release: true
-          access-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ inputs.kernel_repo }}
+          ref: ${{ inputs.kernel_branch }}
+          path: kernel
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev \
+            dwarves device-tree-compiler python3 zip unzip curl wget git \
+            build-essential rsync
+
+      # Ubuntu 22.04 dropped libtinfo5/libncurses5, but the prebuilt
+      # clang-10 (built for Ubuntu 18.04) needs them at runtime.
+      - name: Install legacy libtinfo5 / libncurses5 for clang-10
+        run: |
+          wget -q http://archive.ubuntu.com/ubuntu/pool/universe/n/ncurses/libtinfo5_6.2-0ubuntu2_amd64.deb
+          wget -q http://archive.ubuntu.com/ubuntu/pool/universe/n/ncurses/libncurses5_6.2-0ubuntu2_amd64.deb
+          sudo dpkg -i libtinfo5_6.2-0ubuntu2_amd64.deb libncurses5_6.2-0ubuntu2_amd64.deb
+
+      - name: Cache Clang 10.0.0
+        id: clang-cache
+        uses: actions/cache@v4
+        with:
+          path: toolchain/clang
+          key: clang-10.0.0-ubuntu18.04
+
+      - name: Download Clang 10.0.0
+        if: steps.clang-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p toolchain/clang
+          wget -q "$CLANG_URL" -O clang.tar.xz
+          tar -xf clang.tar.xz -C toolchain/clang --strip-components=1
+          rm clang.tar.xz
+
+      - name: Cache aarch64-linux-android-4.9 toolchain
+        id: gcc-cache
+        uses: actions/cache@v4
+        with:
+          path: toolchain/gcc
+          key: gcc-aarch64-linux-android-4.9-${{ env.GCC_TAG }}
+
+      - name: Download aarch64-linux-android-4.9 toolchain
+        if: steps.gcc-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p toolchain/gcc
+          wget -q "$GCC_ARCHIVE_URL" -O gcc.tar.gz
+          tar -xf gcc.tar.gz -C toolchain/gcc
+          rm gcc.tar.gz
+
+      - name: Build kernel
+        working-directory: kernel
+        run: |
+          export ARCH=arm64
+          export PROJECT_NAME=m23xq
+          export DTC_EXT=dtc
+          export KERNEL_LLVM_BIN="${{ github.workspace }}/toolchain/clang/bin/clang"
+          export BUILD_CROSS_COMPILE="${{ github.workspace }}/toolchain/gcc/bin/aarch64-linux-android-"
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export KERNEL_MAKE_ENV="DTC_EXT=$(pwd)/tools/dtc CONFIG_BUILD_ARM64_DT_OVERLAY=y"
+          export OUT_DIR="$(pwd)/out"
+
+          chmod +x "$KERNEL_LLVM_BIN"
+          rm -rf "$OUT_DIR"
+          mkdir -p "$OUT_DIR"
+
+          # Stage 1: generate .config from the defconfig
+          make -j"$(nproc)" -C "$(pwd)" O="$OUT_DIR" \
+            CC="$KERNEL_LLVM_BIN" CROSS_COMPILE="$BUILD_CROSS_COMPILE" \
+            REAL_CC="$KERNEL_LLVM_BIN" CLANG_TRIPLE="$CLANG_TRIPLE" \
+            CONFIG_SECTION_MISMATCH_WARN_ONLY=y $KERNEL_MAKE_ENV ARCH=arm64 \
+            ${{ inputs.defconfig }} --no-print-directory
+
+          # Stage 2: actual build
+          make -j"$(nproc)" -C "$(pwd)" O="$OUT_DIR" \
+            CC="$KERNEL_LLVM_BIN" CROSS_COMPILE="$BUILD_CROSS_COMPILE" \
+            REAL_CC="$KERNEL_LLVM_BIN" CLANG_TRIPLE="$CLANG_TRIPLE" \
+            CONFIG_SECTION_MISMATCH_WARN_ONLY=y $KERNEL_MAKE_ENV ARCH=arm64 \
+            --no-print-directory
+
+      - name: Build dtbo.img
+        working-directory: kernel
+        run: |
+          DTBO_FILES=$(find out/arch/arm64/boot/dts/samsung/m23/m23xq/ -name '*.dtbo' 2>/dev/null || true)
+          if [ -n "$DTBO_FILES" ] && [ -x tools/mkdtimg ]; then
+            ./tools/mkdtimg create out/arch/arm64/boot/dtbo.img --page_size=4096 $DTBO_FILES
+          else
+            echo "tools/mkdtimg or .dtbo files not found — skipping dtbo.img"
+          fi
+
+      - name: Collect build output
+        run: |
+          mkdir -p output
+          cp kernel/out/arch/arm64/boot/Image output/ 2>/dev/null || true
+          cp kernel/out/arch/arm64/boot/dtbo.img output/ 2>/dev/null || true
+          find kernel/out/arch/arm64/boot/dts -name '*.dtb' -exec cp {} output/ \; 2>/dev/null || true
+          ls -la output
+
+      - name: Upload build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: m23xq-kernel-${{ github.run_number }}
+          path: output/*
+          if-no-files-found: error
