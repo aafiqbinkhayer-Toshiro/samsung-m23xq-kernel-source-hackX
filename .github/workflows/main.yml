@@ -78,30 +78,87 @@ jobs:
           tar -xf gcc.tar.gz -C toolchain/gcc
           rm gcc.tar.gz
 
-      - name: Build kernel
+      - name: Set up build environment
+        run: |
+          chmod +x "${{ github.workspace }}/toolchain/clang/bin/clang"
+          {
+            echo "ARCH=arm64"
+            echo "PROJECT_NAME=m23xq"
+            echo "DTC_EXT=dtc"
+            echo "KERNEL_LLVM_BIN=${{ github.workspace }}/toolchain/clang/bin/clang"
+            echo "BUILD_CROSS_COMPILE=${{ github.workspace }}/toolchain/gcc/bin/aarch64-linux-android-"
+            echo "CLANG_TRIPLE=aarch64-linux-gnu-"
+            echo "OUT_DIR=${{ github.workspace }}/kernel/out"
+            echo "KERNEL_MAKE_ENV=DTC_EXT=${{ github.workspace }}/kernel/tools/dtc CONFIG_BUILD_ARM64_DT_OVERLAY=y"
+          } >> "$GITHUB_ENV"
+
+      - name: Generate kernel config (defconfig)
         working-directory: kernel
         run: |
-          export ARCH=arm64
-          export PROJECT_NAME=m23xq
-          export DTC_EXT=dtc
-          export KERNEL_LLVM_BIN="${{ github.workspace }}/toolchain/clang/bin/clang"
-          export BUILD_CROSS_COMPILE="${{ github.workspace }}/toolchain/gcc/bin/aarch64-linux-android-"
-          export CLANG_TRIPLE=aarch64-linux-gnu-
-          export KERNEL_MAKE_ENV="DTC_EXT=$(pwd)/tools/dtc CONFIG_BUILD_ARM64_DT_OVERLAY=y"
-          export OUT_DIR="$(pwd)/out"
-
-          chmod +x "$KERNEL_LLVM_BIN"
           rm -rf "$OUT_DIR"
           mkdir -p "$OUT_DIR"
-
-          # Stage 1: generate .config from the defconfig
           make -j"$(nproc)" -C "$(pwd)" O="$OUT_DIR" \
             CC="$KERNEL_LLVM_BIN" CROSS_COMPILE="$BUILD_CROSS_COMPILE" \
             REAL_CC="$KERNEL_LLVM_BIN" CLANG_TRIPLE="$CLANG_TRIPLE" \
             CONFIG_SECTION_MISMATCH_WARN_ONLY=y $KERNEL_MAKE_ENV ARCH=arm64 \
             ${{ inputs.defconfig }} --no-print-directory
 
-          # Stage 2: actual build
+      # Checks the generated .config for module signature verification and,
+      # if any of it is enabled, force-disables it completely (not just
+      # module signing itself, but also the "require" / "force" switches
+      # and the hash-algo sub-options), then re-runs olddefconfig so the
+      # rest of the config stays consistent with the change.
+      - name: Check & fully disable module signature verification
+        working-directory: kernel
+        run: |
+          CONFIG_FILE="$OUT_DIR/.config"
+
+          echo "== module signature settings BEFORE =="
+          grep -E "^CONFIG_MODULE_SIG" "$CONFIG_FILE" || echo "(none set — already off)"
+
+          if [ -x scripts/config ]; then
+            ./scripts/config --file "$CONFIG_FILE" \
+              --disable MODULE_SIG \
+              --disable MODULE_SIG_ALL \
+              --disable MODULE_SIG_FORCE \
+              --disable MODULE_SIG_UEFI \
+              --disable MODULE_SIG_PROTECT \
+              --disable MODULE_SIG_SHA1 \
+              --disable MODULE_SIG_SHA256 \
+              --disable MODULE_SIG_SHA384 \
+              --disable MODULE_SIG_SHA512 \
+              --disable MODULE_SIG_HASH
+          else
+            echo "scripts/config not found in this source tree — falling back to sed"
+            sed -i \
+              -e '/^CONFIG_MODULE_SIG/d' \
+              -e '/^# CONFIG_MODULE_SIG.*is not set/d' \
+              "$CONFIG_FILE"
+            {
+              echo "# CONFIG_MODULE_SIG is not set"
+              echo "# CONFIG_MODULE_SIG_ALL is not set"
+              echo "# CONFIG_MODULE_SIG_FORCE is not set"
+            } >> "$CONFIG_FILE"
+          fi
+
+          # Resolve dependent options cleanly instead of leaving a config
+          # that make would stop and prompt on.
+          make -j"$(nproc)" -C "$(pwd)" O="$OUT_DIR" \
+            CC="$KERNEL_LLVM_BIN" CROSS_COMPILE="$BUILD_CROSS_COMPILE" \
+            REAL_CC="$KERNEL_LLVM_BIN" CLANG_TRIPLE="$CLANG_TRIPLE" \
+            ARCH=arm64 olddefconfig --no-print-directory
+
+          echo "== module signature settings AFTER =="
+          if grep -qE "^CONFIG_MODULE_SIG=y" "$CONFIG_FILE"; then
+            echo "!! CONFIG_MODULE_SIG is still enabled — failing the build so it doesn't ship signed-only modules"
+            grep -E "^CONFIG_MODULE_SIG" "$CONFIG_FILE"
+            exit 1
+          fi
+          grep -E "^CONFIG_MODULE_SIG" "$CONFIG_FILE" || echo "fully disabled, confirmed."
+
+      - name: Build kernel
+        working-directory: kernel
+        run: |
           make -j"$(nproc)" -C "$(pwd)" O="$OUT_DIR" \
             CC="$KERNEL_LLVM_BIN" CROSS_COMPILE="$BUILD_CROSS_COMPILE" \
             REAL_CC="$KERNEL_LLVM_BIN" CLANG_TRIPLE="$CLANG_TRIPLE" \
